@@ -1,0 +1,11 @@
+DEF MatlabControl()
+; Initialization
+PTP HOME Vel=100 % DEFAULT ; Move to home first
+LOOP
+  IF move_trigger THEN
+    PTP target_pos Vel=50 % ; Move to target (adjust velocity)
+    move_trigger = FALSE ; Reset trigger
+  ENDIF
+  WAIT SEC 0.1 ; Small delay to avoid CPU overload
+ENDLOOP
+END

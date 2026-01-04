@@ -1,0 +1,4 @@
+DEFDAT MatlabControl PUBLIC
+DECL GLOBAL POS target_pos = {X 500, Y 0, Z 500, A 0, B 90, C 0} ; Default safe position
+DECL GLOBAL BOOL move_trigger = FALSE ; Flag to trigger movement
+ENDDAT

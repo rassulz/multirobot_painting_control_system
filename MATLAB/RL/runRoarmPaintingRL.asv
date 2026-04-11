@@ -1,0 +1,415 @@
+%% =========================================================================
+%  runRoarmPaintingRL.m  —  RL Adaptive Painting Speed for RoArm-M2-S
+% ==========================================================================
+%
+%  The RoArm-M2-S robots perform painting strokes on workpieces.
+%  This RL agent learns the optimal SPEED PROFILE for each stroke to:
+%    • Minimise tracking error (→ uniform paint coverage)
+%    • Maximise throughput (→ faster cycle times)
+%    • Ensure smooth motion (→ no paint splatter)
+%    • Slow down at endpoints/dwells (→ clean transitions)
+%
+%  The learned speed profile maps to the RoArm JSON 'spd' parameter
+%  in commands like: {"T":122,"b":..,"s":..,"e":..,"h":..,"spd":XX,"acc":10}
+%
+%  Requirements:
+%    • MATLAB R2022a+, Reinforcement Learning Toolbox, Deep Learning Toolbox
+%    • roarm_position_rl_dataset.csv in the same folder
+%    • RoarmPaintingEnv.m in the same folder
+%
+%  Usage:   >> runRoarmPaintingRL
+% ==========================================================================
+
+% ── FIX 1: Do NOT use bare 'clear' — it destroys the caller's workspace
+%           (including 'mode' used in Main.m). Only clear local vars if needed.
+%    BEFORE:  clear; clc; close all;
+%    AFTER:   selective cleanup only
+if ~exist('mode','var'), mode = 'all'; end   % default if run standalone
+clc; close all;
+
+fprintf('╔══════════════════════════════════════════════════════════════╗\n');
+fprintf('║  RoArm-M2-S — Adaptive Painting Speed RL                   ║\n');
+fprintf('║  Idea 3: Learn optimal speed per waypoint for paint strokes ║\n');
+fprintf('╚══════════════════════════════════════════════════════════════╝\n\n');
+
+%% ── 0. RESOLVE DATASET ──────────────────────────────────────────────────
+scriptDir = fileparts(mfilename('fullpath'));
+if isempty(scriptDir), scriptDir = pwd; end
+
+csvPath = fullfile(scriptDir, 'roarm_position_rl_dataset.csv');
+if ~isfile(csvPath)
+    csvPath = fullfile(scriptDir, '..', 'roarm_position_rl_dataset.csv');
+end
+assert(isfile(csvPath), 'Cannot find roarm_position_rl_dataset.csv at:\n  %s', csvPath);
+
+%% ── 1. LOAD & PARSE DATASET ────────────────────────────────────────────
+fprintf('[1/7] Loading dataset …\n');
+data = readtable(csvPath, 'VariableNamingRule', 'preserve');
+N    = height(data);
+dt   = data.dt(1);
+fprintf('       %d total timesteps, dt=%.2fs\n', N, dt);
+
+arms = unique(data.arm_id);
+fprintf('       Arms found: %s\n', strjoin(arms, ', '));
+
+episodes = unique(data.run_id);
+fprintf('       Episodes found: %d\n', length(episodes));
+
+armMask  = strcmp(data.arm_id, 'roarm_1');
+armData  = data(armMask, :);
+Na       = height(armData);
+fprintf('       Using roarm_1: %d timesteps\n\n', Na);
+
+%% ── 2. FEATURE ENGINEERING ──────────────────────────────────────────────
+fprintf('[2/7] Engineering features …\n');
+
+target_xyz = [armData.target_x, armData.target_y, armData.target_z];
+meas_xyz   = [armData.meas_x,   armData.meas_y,   armData.meas_z];
+time_s     = armData.time_s;
+
+tracking_error = vecnorm(target_xyz - meas_xyz, 2, 2);
+fprintf('       Tracking error: mean=%.2f mm, max=%.2f mm\n', ...
+    mean(tracking_error), max(tracking_error));
+
+ee_velocity = zeros(Na, 1);
+for k = 2:Na
+    ee_velocity(k) = norm(target_xyz(k,:) - target_xyz(k-1,:)) / dt;
+end
+ee_velocity(1) = ee_velocity(2);
+
+ee_accel = zeros(Na, 1);
+for k = 2:Na
+    ee_accel(k) = (ee_velocity(k) - ee_velocity(k-1)) / dt;
+end
+ee_accel(1) = ee_accel(2);
+
+jerk = zeros(Na, 1);
+for k = 2:Na
+    jerk(k) = (ee_accel(k) - ee_accel(k-1)) / dt;
+end
+jerk(1) = jerk(2);
+
+curvature = zeros(Na, 1);
+for k = 3:Na
+    v1 = target_xyz(k-1,:) - target_xyz(k-2,:);
+    v2 = target_xyz(k,:)   - target_xyz(k-1,:);
+    n1 = norm(v1); n2 = norm(v2);
+    if n1 > 1e-6 && n2 > 1e-6
+        curvature(k) = acos(max(-1, min(1, dot(v1,v2)/(n1*n2))));
+    end
+end
+
+cum_path = zeros(Na, 1);
+for k = 2:Na
+    cum_path(k) = cum_path(k-1) + norm(target_xyz(k,:) - target_xyz(k-1,:));
+end
+progress = cum_path / max(cum_path(end), 1e-6);
+
+is_dwell = false(Na, 1);
+for k = 2:Na
+    if norm(target_xyz(k,:) - target_xyz(k-1,:)) < 0.5
+        is_dwell(k) = true;
+    end
+end
+is_dwell(1) = (norm(target_xyz(1,:) - target_xyz(min(2,Na),:)) < 0.5);
+fprintf('       Dwell steps detected: %d / %d (%.1f%%)\n', ...
+    sum(is_dwell), Na, 100*sum(is_dwell)/Na);
+
+stroke_direction = zeros(Na, 1);
+for k = 2:Na
+    dy = target_xyz(k,2) - target_xyz(k-1,2);
+    if abs(dy) > 1
+        stroke_direction(k) = sign(dy);
+    end
+end
+
+fprintf('       Vel max=%.1f mm/s, Accel max=%.1f mm/s², Jerk max=%.1f mm/s³\n', ...
+    max(ee_velocity), max(abs(ee_accel)), max(abs(jerk)));
+fprintf('       Feature engineering complete.\n\n');
+
+F.tracking_error   = tracking_error;
+F.ee_velocity      = ee_velocity;
+F.ee_accel         = ee_accel;
+F.jerk             = jerk;
+F.curvature        = curvature;
+F.progress         = progress;
+F.is_dwell         = is_dwell;
+F.stroke_direction = stroke_direction;
+F.target_xyz       = target_xyz;
+F.meas_xyz         = meas_xyz;
+F.time_s           = time_s;
+
+%% ── 3. PLOTTING DATASET ────────────────────────────────────────────────
+fprintf('[3/7] Plotting dataset …\n');
+
+fig1 = figure('Name','RoArm Dataset Overview','Position',[50 50 1400 700],'Color','w');
+tl1 = tiledlayout(2,3,'TileSpacing','compact','Padding','compact');
+title(tl1,'RoArm-M2-S — Dataset Overview','FontSize',13,'FontWeight','bold');
+
+nexttile;
+plot3(target_xyz(:,1), target_xyz(:,2), target_xyz(:,3),'b-','LineWidth',1.5);
+hold on;
+plot3(meas_xyz(:,1), meas_xyz(:,2), meas_xyz(:,3),'r--','LineWidth',1);
+xlabel('X'); ylabel('Y'); zlabel('Z');
+title('3D Path: Target vs Measured'); legend('Target','Measured');
+grid on; view(30,25);
+
+nexttile;
+plot(time_s, tracking_error, 'r-', 'LineWidth',1);
+hold on;
+plot(time_s, movmean(tracking_error,10), 'k-', 'LineWidth',2);
+xlabel('Time (s)'); ylabel('mm');
+title(sprintf('Tracking Error (mean=%.2f mm)', mean(tracking_error)));
+legend('Per-step','Smoothed'); grid on;
+
+nexttile;
+plot(time_s, ee_velocity, 'b-', 'LineWidth',1);
+xlabel('Time (s)'); ylabel('mm/s');
+title('End-Effector Velocity'); grid on;
+
+nexttile;
+plot(time_s, curvature, 'm-', 'LineWidth',1);
+xlabel('Time (s)'); ylabel('rad');
+title('Path Curvature'); grid on;
+
+nexttile;
+scatter(ee_velocity, tracking_error, 15, curvature, 'filled');
+colorbar; xlabel('Velocity (mm/s)'); ylabel('Track Error (mm)');
+title('Error vs Velocity (colour=curvature)'); grid on;
+
+nexttile;
+bar([sum(is_dwell), sum(~is_dwell)]);
+set(gca,'XTickLabel',{'Dwell','Moving'});
+ylabel('Step Count'); title('Dwell vs Moving Steps'); grid on;
+
+% Both-arm comparison
+if any(~armMask)
+    fig1b = figure('Name','Both-Arm Comparison','Position',[100 100 900 400],'Color','w');
+    armNames = unique(data.arm_id);
+    hold on;
+    colours = lines(numel(armNames));
+    for ai = 1:numel(armNames)
+        m = strcmp(data.arm_id, armNames{ai});
+        tgt = [data.target_x(m), data.target_y(m), data.target_z(m)];
+        ms  = [data.meas_x(m),   data.meas_y(m),   data.meas_z(m)];
+        err = vecnorm(tgt - ms, 2, 2);
+        plot(data.time_s(m), err, '-', 'Color', colours(ai,:), ...
+             'LineWidth',1.2, 'DisplayName', armNames{ai});
+    end
+    xlabel('Time (s)'); ylabel('Tracking Error (mm)');
+    title('Tracking Error — Both Arms'); legend('Location','best'); grid on;
+end
+fprintf('       Both-arm comparison plotted.\n\n');
+
+%% ── 4. BUILD TD3 AGENT ─────────────────────────────────────────────────
+fprintf('[4/7] Building TD3 agent …\n');
+
+try
+    env = RoarmPaintingEnv();
+
+    obsInfo = getObservationInfo(env);
+    actInfo = getActionInfo(env);
+    obsDim  = obsInfo.Dimension(1);
+    actDim  = 1;   % single speed command
+
+    % ── Actor network ────────────────────────────────────────────────────
+    % FIX 2: Use the correct RL Toolbox API — do NOT pass extra arguments
+    %        that the functions don't accept.
+    actorNet = [
+        featureInputLayer(obsDim, 'Normalization','none', 'Name','obs')
+        fullyConnectedLayer(128, 'Name','fc1')
+        reluLayer('Name','relu1')
+        fullyConnectedLayer(128, 'Name','fc2')
+        reluLayer('Name','relu2')
+        fullyConnectedLayer(64,  'Name','fc3')
+        reluLayer('Name','relu3')
+        fullyConnectedLayer(actDim, 'Name','fc_out')
+        tanhLayer('Name','tanh')            % outputs in [-1, 1]
+        scalingLayer('Name','scale', 'Scale', 0.5, 'Bias', 0.5)  % map to [0, 1]
+    ];
+    actorNet = dlnetwork(actorNet);
+
+    actor = rlContinuousDeterministicActor(actorNet, obsInfo, actInfo);
+
+    % ── Critic networks (TD3 uses two critics) ──────────────────────────
+    critic1 = buildCriticNetwork(obsDim, actDim, obsInfo, actInfo);
+    critic2 = buildCriticNetwork(obsDim, actDim, obsInfo, actInfo);
+
+    % ── TD3 Agent Options ────────────────────────────────────────────────
+    agentOpts = rlTD3AgentOptions( ...
+        'ExperienceBufferLength',   2e5, ...
+        'MiniBatchSize',            256, ...
+        'NumWarmStartSteps',        1000, ...
+        'DiscountFactor',           0.99, ...
+        'TargetSmoothFactor',       0.005 ...
+    );
+    agentOpts.ActorOptimizerOptions  = rlOptimizerOptions('LearnRate', 3e-4);
+    agentOpts.CriticOptimizerOptions = rlOptimizerOptions('LearnRate', 1e-3);
+
+    % Exploration noise
+    agentOpts.ExplorationModel = rl.option.GaussianActionNoise( ...
+        'StandardDeviation', 0.1, ...
+        'StandardDeviationDecayRate', 1e-5);
+
+    agent = rlTD3Agent(actor, [critic1, critic2], agentOpts);
+    fprintf('       TD3 agent created successfully.\n\n');
+
+catch ME
+    fprintf('\n  ✗ Agent build FAILED:\n    %s\n', ME.message);
+    if ~isempty(ME.stack)
+        fprintf('    Line %d in %s\n', ME.stack(1).line, ME.stack(1).name);
+    end
+    % ── FIX 3: Don't let the error propagate as a cleared-variable error.
+    %           Return/rethrow cleanly so 'mode' is preserved in caller.
+    rethrow(ME);
+end
+
+%% ── 5. TRAIN ────────────────────────────────────────────────────────────
+fprintf('[5/7] Training TD3 agent …\n');
+
+if any(strcmp(mode, {'all', 'train'}))
+    trainOpts = rlTrainingOptions( ...
+        'MaxEpisodes',        2000, ...
+        'MaxStepsPerEpisode', env.MaxSteps, ...
+        'ScoreAveragingWindowLength', 50, ...
+        'Verbose',            true, ...
+        'Plots',              'training-progress', ...
+        'StopTrainingCriteria', 'AverageReward', ...
+        'StopTrainingValue',    -0.5 ...
+    );
+
+    trainingStats = train(agent, env, trainOpts);
+
+    save('roarm_td3_agent_improved.mat', 'agent', 'trainingStats');
+    fprintf('       Agent saved to roarm_td3_agent_improved.mat\n\n');
+else
+    fprintf('       Skipping training (mode=%s).\n\n', mode);
+end
+
+%% ── 6. EVALUATE ─────────────────────────────────────────────────────────
+fprintf('[6/7] Evaluating agent …\n');
+
+if any(strcmp(mode, {'all', 'evaluate', 'eval'}))
+    obs     = reset(env);
+    isDone  = false;
+    steps   = 0;
+    maxLen  = env.MaxSteps;
+
+    logEval.time        = zeros(maxLen,1);
+    logEval.speedRL     = zeros(maxLen,1);
+    logEval.trackErr    = zeros(maxLen,1);
+    logEval.reward      = zeros(maxLen,1);
+
+    t = 0;
+    while ~isDone
+        steps = steps + 1;
+        action = getAction(agent, {obs});
+        action = action{1};
+        [obs, reward, isDone, ~] = step(env, action);
+
+        logEval.time(steps)     = t;
+        logEval.speedRL(steps)  = action;
+        logEval.trackErr(steps) = env.PrevError;
+        logEval.reward(steps)   = reward;
+        t = t + env.Ts;
+    end
+
+    % Trim
+    n = steps;
+    flds = fieldnames(logEval);
+    for kk = 1:numel(flds), logEval.(flds{kk}) = logEval.(flds{kk})(1:n); end
+
+    rmse_rl = rms(logEval.trackErr);
+    fprintf('       RL RMSE: %.3f mm, Mean speed: %.4f, Mean reward: %.4f\n', ...
+            rmse_rl, mean(logEval.speedRL), mean(logEval.reward));
+    fprintf('       Evaluation complete.\n\n');
+else
+    fprintf('       Skipping evaluation (mode=%s).\n\n', mode);
+end
+
+%% ── 7. DEPLOY / GENERATE JSON ──────────────────────────────────────────
+fprintf('[7/7] Deployment artifacts …\n');
+
+if any(strcmp(mode, {'all', 'deploy'}))
+    % Generate a lookup table for deployment on RoArm
+    nWaypoints   = min(Na, 100);
+    sampleIdx    = round(linspace(1, Na, nWaypoints));
+    deployTable  = table();
+    deployTable.waypoint   = (1:nWaypoints)';
+    deployTable.target_x   = target_xyz(sampleIdx, 1);
+    deployTable.target_y   = target_xyz(sampleIdx, 2);
+    deployTable.target_z   = target_xyz(sampleIdx, 3);
+
+    % Get RL speed for each sampled waypoint
+    deployTable.rl_speed   = zeros(nWaypoints, 1);
+    obs = reset(env);
+    for wi = 1:nWaypoints
+        action = getAction(agent, {obs});
+        action = action{1};
+        deployTable.rl_speed(wi) = action;
+        [obs, ~, isDone, ~] = step(env, action);
+        if isDone, break; end
+    end
+
+    % Map speed [0,1] → RoArm JSON 'spd' parameter [1..100]
+    deployTable.roarm_spd = round(deployTable.rl_speed * 99 + 1);
+    deployTable.roarm_spd = max(1, min(100, deployTable.roarm_spd));
+
+    writetable(deployTable, 'roarm_rl_speed_profile.csv');
+    fprintf('       Speed profile saved to roarm_rl_speed_profile.csv\n');
+
+    % Print sample JSON commands
+    fprintf('\n       Sample RoArm JSON commands:\n');
+    for wi = 1:min(5, nWaypoints)
+        fprintf('       {"T":122,"x":%.1f,"y":%.1f,"z":%.1f,"spd":%d,"acc":10}\n', ...
+                deployTable.target_x(wi), deployTable.target_y(wi), ...
+                deployTable.target_z(wi), deployTable.roarm_spd(wi));
+    end
+    fprintf('       … (%d waypoints total)\n\n', nWaypoints);
+else
+    fprintf('       Skipping deployment (mode=%s).\n\n', mode);
+end
+
+fprintf('╔══════════════════════════════════════════════════════════════╗\n');
+fprintf('║  Pipeline complete                                          ║\n');
+fprintf('╚══════════════════════════════════════════════════════════════╝\n');
+
+%% ═══════════════════════════════════════════════════════════════════════
+%  LOCAL HELPER FUNCTIONS
+%  ═══════════════════════════════════════════════════════════════════════
+
+function critic = buildCriticNetwork(obsDim, actDim, obsInfo, actInfo)
+    % Observation path
+    obsPath = [
+        featureInputLayer(obsDim, 'Normalization','none', 'Name','obs')
+        fullyConnectedLayer(128, 'Name','obs_fc1')
+        reluLayer('Name','obs_relu1')
+    ];
+    % Action path
+    actPath = [
+        featureInputLayer(actDim, 'Normalization','none', 'Name','act')
+        fullyConnectedLayer(128, 'Name','act_fc1')
+        reluLayer('Name','act_relu1')
+    ];
+    % Common path
+    commonPath = [
+        additionLayer(2, 'Name','add')
+        fullyConnectedLayer(128, 'Name','common_fc1')
+        reluLayer('Name','common_relu1')
+        fullyConnectedLayer(64,  'Name','common_fc2')
+        reluLayer('Name','common_relu2')
+        fullyConnectedLayer(1,   'Name','qvalue')
+    ];
+
+    net = layerGraph();
+    net = addLayers(net, obsPath);
+    net = addLayers(net, actPath);
+    net = addLayers(net, commonPath);
+    net = connectLayers(net, 'obs_relu1', 'add/in1');
+    net = connectLayers(net, 'act_relu1', 'add/in2');
+    net = dlnetwork(net);
+
+    critic = rlQValueFunction(net, obsInfo, actInfo, ...
+        'ObservationInputNames', {'obs'}, ...
+        'ActionInputNames',     {'act'});
+end

@@ -53,8 +53,8 @@ function cfg = buildConfig()
     cfg.STRIPE_H  = 10;
     cfg.APPROACH  = 10;
     cfg.PAINT_SPD = 5.0;
-    cfg.IP1       = '192.168.1.192';
-    cfg.IP2       = '192.168.1.101';
+    cfg.IP1       = '172.31.17.192';
+    cfg.IP2       = '172.31.17.102';
     cfg.BASE_URL  = '/js?json=';
     cfg.HTTP_TO   = 0.8;
     cfg.READ_TO   = 0.3;

@@ -23,15 +23,40 @@ scriptDir = fileparts(mfilename('fullpath'));
 if isempty(scriptDir), scriptDir = pwd; end
 csvPath = fullfile(scriptDir, 'kuka_rl_dataset.csv');
 if ~isfile(csvPath)
-    csvPath = fullfile('C:','Users','SYNAPTICON','Desktop', ...
-        'multirobot_painting_control_system','MATLAB','RL','kuka_rl_dataset.csv');
+    % Try sibling KUKA_control folder where the GUI writes its dataset.
+    altPath = fullfile(scriptDir, '..', 'KUKA_control', 'kuka_rl_dataset.csv');
+    if isfile(altPath)
+        csvPath = altPath;
+    end
 end
 assert(isfile(csvPath), 'Cannot find kuka_rl_dataset.csv at:\n  %s', csvPath);
 
 %% ── 1. LOAD DATA & ENGINEER FEATURES ───────────────────────────────────
 fprintf('[1/6] Loading dataset …\n');
 data = readtable(csvPath, 'VariableNamingRule', 'preserve');
+
+% Drop aborted/failed runs — they corrupt RL training.
+if ismember('run_status', data.Properties.VariableNames)
+    keep = string(data.run_status) == "completed";
+    nDropped = sum(~keep);
+    if nDropped > 0
+        fprintf('       Dropping %d rows from aborted runs.\n', nDropped);
+    end
+    data = data(keep, :);
+end
+
+% Drop rows where measurement was never refreshed (stale meas_x/y/z).
+if ismember('meas_valid', data.Properties.VariableNames)
+    validMask = data.meas_valid > 0;
+    nStale = sum(~validMask);
+    if nStale > 0
+        fprintf('       Dropping %d rows with stale meas_valid=0.\n', nStale);
+    end
+    data = data(validMask, :);
+end
+
 N    = height(data);
+assert(N > 0, 'No usable rows after filtering. Re-collect dataset.');
 dt   = data.dt(1);  % 0.03s
 fprintf('       %d timesteps, dt=%.3fs, total=%.2fs\n', N, dt, data.time_s(end));
 

@@ -1,4 +1,4 @@
-function kuka_pick_and_place_gui()
+function kuka_pick_and_place_gui_dataset()
 %% KUKA Pick-and-Place GUI (WORKING with KUKAVARPROXY trigger sampling)
 % This version is based on your proven executor behavior:
 %  - DOES NOT force S/T (A4-safe strategy)
@@ -600,19 +600,24 @@ function kuka_pick_and_place_gui()
                 end
             end
 
-            % Poll real-time telemetry from robot
+            % --- ALWAYS read Cartesian POS_ACT every step (cheap, single var) ---
+            % Without this, meas_x/y/z stays frozen for many rows and the RL
+            % dataset becomes unusable.
+            posNow = readPosActOnly(S.tcp);
+            if ~any(isnan(posNow))
+                last_cartesian = posNow;
+                last_telem_step = i;
+                telem_fresh(i) = true;
+            end
+
+            % Heavier telemetry (torque/velocity/current) — polled less often
+            % since each readVar adds latency to the control loop.
             if mod(i, TELEM_POLL_RATE)==0 || i==1 || i==N
-                telem = readTelemetry(S.tcp);
+                telem = readHeavyTelemetry(S.tcp);
 
                 idx = ~isnan(telem.torque);
                 if any(idx)
                     last_torque(idx) = telem.torque(idx);
-                    telem_fresh(i) = true;
-                end
-
-                idx = ~isnan(telem.cartesian);
-                if any(idx)
-                    last_cartesian(idx) = telem.cartesian(idx);
                     telem_fresh(i) = true;
                 end
 
@@ -995,16 +1000,33 @@ function kuka_pick_and_place_gui()
         end
     end
 
-    function telem = readTelemetry(tcp)
-        % Reads telemetry from KUKA via KUKAVARPROXY.
-        % Uses individual array element reads (proven working approach).
+    function xyz = readPosActOnly(tcp)
+        % Single-variable POS_ACT read. Cheap enough to call every step.
+        xyz = nan(1,3);
+        try
+            result = readVar(tcp, '$POS_ACT');
+            if ischar(result) || isstring(result)
+                s = char(result);
+                labels = {'X','Y','Z'};
+                for k = 1:3
+                    tok = regexp(s, sprintf('%s\\s+([-\\d.eE]+)', labels{k}), 'tokens');
+                    if ~isempty(tok)
+                        xyz(k) = str2double(tok{1}{1});
+                    end
+                end
+            end
+        catch
+        end
+    end
+
+    function telem = readHeavyTelemetry(tcp)
+        % Reads torque/velocity/current from KUKA via KUKAVARPROXY.
+        % POS_ACT is read separately by readPosActOnly().
         %
         % KUKA system variables:
         %   $TORQUE_AXIS_ACT[i]  - joint torque (% of max)
         %   $VEL_AXIS_ACT[i]     - joint velocity (% of max)
         %   $CURR_ACT[i]         - motor current (A)
-        %   $POS_ACT             - Cartesian position (E6POS struct)
-        %   $AXIS_ACT            - joint angles (E6AXIS struct)
         %
         % Fallback: $TORMON_DAT[i].TORQUE_ACT for some KRC versions.
 
@@ -1012,7 +1034,6 @@ function kuka_pick_and_place_gui()
         telem.torque  = nan(1,6);
         telem.velocity = nan(1,6);
         telem.current  = nan(1,6);
-        telem.cartesian = nan(1,3);
 
         % --- Torques: $TORQUE_AXIS_ACT[i] (KRC4) ---
         torque_read = false;
@@ -1056,22 +1077,6 @@ function kuka_pick_and_place_gui()
                 val = readVar(tcp, sprintf('$CURR_ACT[%d]', j));
                 if isnumeric(val) && ~isnan(val)
                     telem.current(j) = val;
-                end
-            end
-        catch
-        end
-
-        % --- Cartesian position: $POS_ACT (E6POS struct string) ---
-        try
-            result = readVar(tcp, '$POS_ACT');
-            if ischar(result) || isstring(result)
-                s = char(result);
-                labels = {'X','Y','Z'};
-                for k = 1:3
-                    tok = regexp(s, sprintf('%s\\s+([-\\d.eE]+)', labels{k}), 'tokens');
-                    if ~isempty(tok)
-                        telem.cartesian(k) = str2double(tok{1}{1});
-                    end
                 end
             end
         catch

@@ -7,7 +7,9 @@ DEF MatlabControl()
 
     ; Safe init - resets defaults
     BAS(#INITMOV,0)
-
+    $TOOL = TOOL_DATA[10]
+    $BASE = BASE_DATA[0]
+    
     ; Set safe initial velocities + accelerations (100%)
     FOR I = 1 TO 6
         $VEL_AXIS[I] = 100

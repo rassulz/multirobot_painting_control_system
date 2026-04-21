@@ -1,21 +1,20 @@
 function kuka_pick_and_place_gui()
-%% KUKA Pick-and-Place GUI (WORKING with KUKAVARPROXY trigger sampling)
-% This version is based on your proven executor behavior:
-%  - DOES NOT force S/T (A4-safe strategy)
-%  - Uses robot-native Euler convention (small |B|) by design
+%% KUKA Pick-and-Place GUI with VACUUM GRIPPER (vacuum_cmd -> $OUT[24])
 %  - Uses a REAL trigger pulse width (12 ms) so KRL can detect move_trigger
 %  - Uses smooth quintic interpolation between A4-safe key poses
 %  - Adds GUI for Home / Pick / Place + Connect / Preview / Execute / STOP
-%
-% Requirements on KUKA side (same as your working scripts):
+%  - Vacuum control writes vacuum_cmd (BOOL) via KUKAVARPROXY
+%  - MatlabControl.src mirrors vacuum_cmd to physical $OUT[24]
 %  - KUKAVARPROXY running
 %  - MatlabControl.src running and reading:
-%       target_pos  (string / char buffer)
-%       move_trigger (bool)
+%       target_pos   (POS)
+%       move_trigger (BOOL)
+%       vacuum_cmd   (BOOL)
 %  - Robot in T1 and safety cleared
+%  - $OUT[24] wired to solenoid valve for vacuum gripper
 
     %% ===== UI FIGURE =====
-    fig = uifigure('Name','KUKA Pick-and-Place (A4-safe Smooth GUI)', ...
+    fig = uifigure('Name','KUKA Pick-and-Place (A4-safe Smooth GUI + Vacuum)', ...
         'Position',[40 30 1750 700], 'Color',[0.95 0.95 0.95], ...
         'CloseRequestFcn',@onClose);
 
@@ -29,7 +28,6 @@ function kuka_pick_and_place_gui()
     S.z_clearance = 300;
 
     % Default poses (mm / deg) - A4/A5-safe orientation
-    % A ≈ -180, B small, C ≈ -179.90 avoids wrist limit switches
     S.home  = [550  0   650   -180  0.5  -179.90];
     S.pick  = [608  117 263   -180  0.5  -179.90];
     S.place = [45   204 204   -180  0.5  -179.90];
@@ -40,7 +38,7 @@ function kuka_pick_and_place_gui()
     S.tcp = [];
     S.connected = false;
 
-    % Controller-chosen S/T tracking (read from $POS_ACT)
+    % Controller-chosen S/T tracking
     S.robot_s = 2;
     S.robot_t = 35;
 
@@ -51,6 +49,12 @@ function kuka_pick_and_place_gui()
     % Execution
     S.running = false;
     S.stopRequested = false;
+
+    % Vacuum state (NEW)
+    S.vacuum_enabled = true;
+    S.vacuum_grip_delay = 0.8;
+    S.vacuum_release_delay = 0.5;
+    S.vacuum_is_on = false;
 
     %% ===== LEFT PANEL =====
     pnlL = uipanel(fig,'Title','Setup','FontWeight','bold', ...
@@ -93,47 +97,70 @@ function kuka_pick_and_place_gui()
     efPulseMs = uieditfield(pnlL,'numeric','Position',[140 426 90 22], ...
         'Value',12,'Limits',[3 50],'RoundFractionalValues','on');
 
-    % Connection
-    uilabel(pnlL,'Text','Connection','Position',[10 396 300 22],'FontWeight','bold');
-    uilabel(pnlL,'Text','IP','Position',[10 374 40 22]);
-    efIP = uieditfield(pnlL,'text','Position',[50 374 160 22],'Value',S.robot_ip);
-    uilabel(pnlL,'Text','Port','Position',[220 374 40 22]);
-    efPort = uieditfield(pnlL,'numeric','Position',[265 374 80 22],'Value',S.port);
+    % ===== VACUUM GRIPPER SECTION (NEW) =====
+    uilabel(pnlL,'Text','Vacuum Gripper','Position',[10 396 300 22],'FontWeight','bold');
 
-    btnConnect = uibutton(pnlL,'push','Text','Connect','Position',[10 342 190 28], ...
+    cbVacuumEnable = uicheckbox(pnlL,'Text','Enable vacuum control ($OUT[24])', ...
+        'Position',[10 374 250 22],'Value',true, ...
+        'ValueChangedFcn',@onVacuumEnableChanged);
+
+    uilabel(pnlL,'Text','Grip delay (s)','Position',[10 352 100 22]);
+    efGripDelay = uieditfield(pnlL,'numeric','Position',[140 352 90 22], ...
+        'Value',S.vacuum_grip_delay,'Limits',[0.1 5.0]);
+
+    uilabel(pnlL,'Text','Release delay (s)','Position',[10 330 120 22]);
+    efReleaseDelay = uieditfield(pnlL,'numeric','Position',[140 330 90 22], ...
+        'Value',S.vacuum_release_delay,'Limits',[0.1 5.0]);
+
+    btnTestVacuum = uibutton(pnlL,'push','Text','Test Vacuum','Position',[250 352 150 28], ...
+        'BackgroundColor',[0.4 0.7 0.9],'FontColor','w','FontWeight','bold', ...
+        'Enable','off','ButtonPushedFcn',@(~,~)doTestVacuum());
+
+    lblVacuumStatus = uilabel(pnlL,'Text','● VACUUM OFF', ...
+        'Position',[250 330 150 22],'FontWeight','bold','FontColor',[0.7 0 0], ...
+        'HorizontalAlignment','center');
+
+    % Connection
+    uilabel(pnlL,'Text','Connection','Position',[10 300 300 22],'FontWeight','bold');
+    uilabel(pnlL,'Text','IP','Position',[10 278 40 22]);
+    efIP = uieditfield(pnlL,'text','Position',[50 278 160 22],'Value',S.robot_ip);
+    uilabel(pnlL,'Text','Port','Position',[220 278 40 22]);
+    efPort = uieditfield(pnlL,'numeric','Position',[265 278 80 22],'Value',S.port);
+
+    btnConnect = uibutton(pnlL,'push','Text','Connect','Position',[10 246 190 28], ...
         'BackgroundColor',[0.2 0.7 0.3],'FontColor','w','FontWeight','bold', ...
         'ButtonPushedFcn',@onConnect);
 
-    btnDisconnect = uibutton(pnlL,'push','Text','Disconnect','Position',[210 342 190 28], ...
+    btnDisconnect = uibutton(pnlL,'push','Text','Disconnect','Position',[210 246 190 28], ...
         'BackgroundColor',[0.75 0.2 0.2],'FontColor','w','FontWeight','bold', ...
         'Enable','off','ButtonPushedFcn',@(~,~)doDisconnect());
 
-    lblConn = uilabel(pnlL,'Text','Status: Disconnected','Position',[10 320 390 20], ...
+    lblConn = uilabel(pnlL,'Text','Status: Disconnected','Position',[10 224 390 20], ...
         'FontColor',[0.7 0 0]);
 
     % Poses
-    uilabel(pnlL,'Text','Home (X Y Z A B C)','Position',[10 290 300 20], ...
+    uilabel(pnlL,'Text','Home (X Y Z A B C)','Position',[10 196 300 20], ...
         'FontWeight','bold','FontColor',[0.5 0 0.5]);
-    efHome = poseFields(pnlL,268,S.home,@(~,~)refreshPreview());
+    efHome = poseFields(pnlL,174,S.home,@(~,~)refreshPreview());
 
-    uilabel(pnlL,'Text','Pick (X Y Z A B C)','Position',[10 240 300 20], ...
+    uilabel(pnlL,'Text','Pick (X Y Z A B C)','Position',[10 148 300 20], ...
         'FontWeight','bold','FontColor',[0 0.6 0]);
-    efPick = poseFields(pnlL,218,S.pick,@(~,~)refreshPreview());
+    efPick = poseFields(pnlL,126,S.pick,@(~,~)refreshPreview());
 
-    uilabel(pnlL,'Text','Place (X Y Z A B C)','Position',[10 190 300 20], ...
+    uilabel(pnlL,'Text','Place (X Y Z A B C)','Position',[10 100 300 20], ...
         'FontWeight','bold','FontColor',[0.8 0 0]);
-    efPlace = poseFields(pnlL,168,S.place,@(~,~)refreshPreview());
+    efPlace = poseFields(pnlL,78,S.place,@(~,~)refreshPreview());
 
     % Actions
-    btnPreview = uibutton(pnlL,'push','Text','Preview Trajectory','Position',[10 115 390 32], ...
+    btnPreview = uibutton(pnlL,'push','Text','Preview Trajectory','Position',[10 42 390 28], ...
         'BackgroundColor',[0.2 0.5 0.9],'FontColor','w','FontWeight','bold', ...
         'ButtonPushedFcn',@(~,~)doPreview());
 
-    btnExecute = uibutton(pnlL,'push','Text','Execute on Robot','Position',[10 72 390 32], ...
+    btnExecute = uibutton(pnlL,'push','Text','Execute on Robot','Position',[10 10 190 28], ...
         'BackgroundColor',[0.95 0.55 0.1],'FontColor','w','FontWeight','bold', ...
         'Enable','off','ButtonPushedFcn',@(~,~)doExecute());
 
-    btnStop = uibutton(pnlL,'push','Text','STOP','Position',[10 28 390 32], ...
+    btnStop = uibutton(pnlL,'push','Text','STOP','Position',[210 10 190 28], ...
         'BackgroundColor',[0.85 0.1 0.1],'FontColor','w','FontSize',14,'FontWeight','bold', ...
         'Enable','off','ButtonPushedFcn',@(~,~)setStop());
 
@@ -170,6 +197,7 @@ function kuka_pick_and_place_gui()
     %% ===== INIT DRAW =====
     refreshPreview();
     logMsg('Ready. Set Home/Pick/Place -> Preview -> Connect -> Execute.');
+    logMsg('Vacuum control writes vacuum_cmd, and KRL mirrors it to $OUT[24].');
 
     %% =====================================================================
     %% CALLBACKS / ACTIONS
@@ -195,6 +223,17 @@ function kuka_pick_and_place_gui()
         logMsg(['Robot model set: ' S.robot_model]);
     end
 
+    function onVacuumEnableChanged(~,~)
+        S.vacuum_enabled = cbVacuumEnable.Value;
+        efGripDelay.Enable = S.vacuum_enabled;
+        efReleaseDelay.Enable = S.vacuum_enabled;
+        if S.vacuum_enabled
+            logMsg('Vacuum gripper control ENABLED ($OUT[24]).');
+        else
+            logMsg('Vacuum gripper control DISABLED.');
+        end
+    end
+
     function onConnect(~,~)
         if S.connected, return; end
         S.robot_ip = efIP.Value;
@@ -209,9 +248,13 @@ function kuka_pick_and_place_gui()
             btnConnect.Enable = 'off';
             btnDisconnect.Enable = 'on';
             btnExecute.Enable = 'on';
+            btnTestVacuum.Enable = 'on';
+
+            % Ensure vacuum OFF on connect
+            setVacuum(false);
 
             [S.robot_s,S.robot_t] = readSTFromPosAct(S.tcp,S.robot_s,S.robot_t);
-            logMsg(sprintf('Connected. Read $POS_ACT S=%d, T=%d', S.robot_s, S.robot_t));
+            logMsg(sprintf('Connected. S=%d, T=%d. Vacuum OFF (safe start).', S.robot_s, S.robot_t));
         catch ME
             logMsg(['Connect FAILED: ' ME.message]);
             uialert(fig, ME.message, 'Connect Failed');
@@ -220,6 +263,12 @@ function kuka_pick_and_place_gui()
 
     function doDisconnect()
         if ~S.connected, return; end
+        % Safety: vacuum OFF before disconnect
+        try
+            setVacuum(false);
+            logMsg('Vacuum OFF (disconnect safety).');
+        catch
+        end
         try
             if ~isempty(S.tcp) && isvalid(S.tcp)
                 clear S.tcp;
@@ -233,14 +282,27 @@ function kuka_pick_and_place_gui()
         btnConnect.Enable = 'on';
         btnDisconnect.Enable = 'off';
         btnExecute.Enable = 'off';
+        btnTestVacuum.Enable = 'off';
         logMsg('Disconnected.');
+    end
+
+    function doTestVacuum()
+        if ~S.connected
+            uialert(fig,'Not connected to robot.','Error'); return;
+        end
+        logMsg('Testing vacuum: vacuum_cmd = TRUE ...');
+        setVacuum(true);
+        pause(2.0);
+        setVacuum(false);
+        logMsg('Testing vacuum: vacuum_cmd = FALSE. Test complete.');
     end
 
     function doPreview()
         readUIToState();
         buildTrajectory();
         drawTrajectory();
-        logMsg(sprintf('Preview: key_poses=%d, waypoints=%d', size(S.key_poses,1), size(S.waypoints,1)));
+        logMsg(sprintf('Preview: key_poses=%d, waypoints=%d, vacuum=%s', ...
+            size(S.key_poses,1), size(S.waypoints,1), mat2str(S.vacuum_enabled)));
     end
 
     function doExecute()
@@ -252,14 +314,21 @@ function kuka_pick_and_place_gui()
         buildTrajectory();
         drawTrajectory();
 
+        vacStr = 'DISABLED';
+        if S.vacuum_enabled, vacStr = sprintf('ENABLED (grip=%.1fs, release=%.1fs)', ...
+                S.vacuum_grip_delay, S.vacuum_release_delay); end
+
         answ = uiconfirm(fig, ...
             sprintf(['Execute on REAL robot?\n\n' ...
                      'Ensure:\n' ...
                      '- MatlabControl.src is RUNNING (not paused)\n' ...
                      '- Robot is in T1, deadman ready\n' ...
-                     '- Workspace clear\n\n' ...
-                     'Waypoints: %d\nPulse: %d ms\nDT: %.3f s'], ...
-                     size(S.waypoints,1), round(efPulseMs.Value), efDT.Value), ...
+                     '- Workspace clear\n' ...
+                     '- Vacuum compressor ON (if using gripper)\n' ...
+                     '- Object at PICK location\n\n' ...
+                     'Waypoints: %d\nPulse: %d ms\nDT: %.3f s\n' ...
+                     'Vacuum: %s'], ...
+                     size(S.waypoints,1), round(efPulseMs.Value), efDT.Value, vacStr), ...
             'Confirm', 'Options',{'EXECUTE','Cancel'}, 'DefaultOption','Cancel', ...
             'Icon','warning');
 
@@ -273,7 +342,14 @@ function kuka_pick_and_place_gui()
 
     function setStop()
         S.stopRequested = true;
-        logMsg('STOP requested.');
+        % Immediate vacuum OFF on stop
+        if S.connected
+            try
+                setVacuum(false);
+            catch
+            end
+        end
+        logMsg('STOP requested. Vacuum OFF.');
     end
 
     function onClose(~,~)
@@ -283,7 +359,66 @@ function kuka_pick_and_place_gui()
     end
 
     %% =====================================================================
-    %% STATE / TRAJECTORY
+    %% VACUUM CONTROL — Direct $OUT[24] via KUKAVARPROXY (NEW)
+    %% =====================================================================
+
+    function setVacuum(on)
+        % Write a simple BOOL first, then let KRL mirror it to $OUT[24].
+        cmdText = boolToKRL(on);
+        ok = writeVar(S.tcp, 'vacuum_cmd', cmdText);
+        if ~ok
+            error('Failed to write vacuum_cmd via KUKAVARPROXY.');
+        end
+
+        % Give the KRL loop a moment to mirror vacuum_cmd to the output.
+        pause(0.03);
+
+        if on
+            S.vacuum_is_on = true;
+            lblVacuumStatus.Text = 'VACUUM ON';
+            lblVacuumStatus.Text = 'â— VACUUM ON';
+            lblVacuumStatus.Text = 'VACUUM ON';
+            lblVacuumStatus.FontColor = [0 0.7 0];
+        else
+            S.vacuum_is_on = false;
+            lblVacuumStatus.Text = 'VACUUM OFF';
+            lblVacuumStatus.Text = 'â— VACUUM OFF';
+            lblVacuumStatus.Text = 'VACUUM OFF';
+            lblVacuumStatus.FontColor = [0.7 0 0];
+        end
+
+        cmdEcho = readBoolVar(S.tcp, 'vacuum_cmd');
+        outEcho = readBoolVar(S.tcp, '$OUT[24]');
+
+        if ~isempty(cmdEcho) && cmdEcho ~= on
+            logMsg(sprintf('Warning: vacuum_cmd readback=%s, expected=%s.', ...
+                boolToKRL(cmdEcho), cmdText));
+        end
+
+        if ~isempty(outEcho) && outEcho ~= on
+            logMsg(sprintf(['Warning: $OUT[24] readback=%s, expected=%s. ' ...
+                            'Check IOSYS mapping, SYS reservation, or PLC overwrite.'], ...
+                boolToKRL(outEcho), cmdText));
+        end
+    end
+
+    function setVacuumLegacy(on)
+        % Writes $OUT[24] directly via KUKAVARPROXY — no KRL changes needed
+        if on
+            writeVar(S.tcp, '$OUT[24]', 'TRUE');
+            S.vacuum_is_on = true;
+            lblVacuumStatus.Text = '● VACUUM ON';
+            lblVacuumStatus.FontColor = [0 0.7 0];
+        else
+            writeVar(S.tcp, '$OUT[24]', 'FALSE');
+            S.vacuum_is_on = false;
+            lblVacuumStatus.Text = '● VACUUM OFF';
+            lblVacuumStatus.FontColor = [0.7 0 0];
+        end
+    end
+
+    %% =====================================================================
+    %% STATE / TRAJECTORY (UNCHANGED from your working version)
     %% =====================================================================
 
     function readUIToState()
@@ -292,6 +427,9 @@ function kuka_pick_and_place_gui()
         S.home  = readPose(efHome);
         S.pick  = readPose(efPick);
         S.place = readPose(efPlace);
+        S.vacuum_enabled = cbVacuumEnable.Value;
+        S.vacuum_grip_delay = efGripDelay.Value;
+        S.vacuum_release_delay = efReleaseDelay.Value;
         if efCustomReach.Visible
             S.max_reach = efCustomReach.Value;
             lblReach.Text = sprintf('Reach: %.0f mm', S.max_reach);
@@ -299,22 +437,15 @@ function kuka_pick_and_place_gui()
     end
 
     function buildTrajectory()
-        % Keep your A4-safe structure:
-        % HOME -> approach pick -> pick -> lift -> MID -> TRANS -> approach place -> place -> lift -> HOME
         H = S.home; Pk = S.pick; Pl = S.place;
         Zc = S.z_clearance;
 
-        % Transition / intermediate (your proven A4 fix)
         TRANS_X = (Pk(1)+Pl(1))/2;
         TRANS_Y = (Pk(2)+Pl(2))/2;
         TRANS_Z = max(Pk(3), Pl(3)) + Zc;
         MID_Y   = (Pk(2) + TRANS_Y)/2;
 
-        % ---- A4/A5-safe orientation strategy ----
-        % safeOrientation() dynamically constrains A/B/C so C stays
-        % near -179.90 (not fixed) and A4/A5 never hit limit switches.
-        % Offsets are tiny (< 0.5 deg) for smooth pose variation.
-        C_TARGET = -179.90;  % soft target for C (dynamically enforced)
+        C_TARGET = -179.90;
 
         ORIENT_HOME           = safeOrientation(H(4:6),   C_TARGET);
         ORIENT_APPROACH_PICK  = safeOrientation([Pk(4), Pk(5), Pk(6)+0.3], C_TARGET);
@@ -326,6 +457,17 @@ function kuka_pick_and_place_gui()
         ORIENT_PLACE          = safeOrientation([Pl(4), Pl(5), Pl(6)-0.1], C_TARGET);
         ORIENT_LIFT_PLACE     = safeOrientation([Pl(4), Pl(5), Pl(6)-0.2], C_TARGET);
 
+        % Key poses:
+        %  1: HOME
+        %  2: APPROACH PICK
+        %  3: PICK              ← VACUUM ON here
+        %  4: LIFT PICK
+        %  5: MID
+        %  6: TRANSITION
+        %  7: APPROACH PLACE
+        %  8: PLACE             ← VACUUM OFF here
+        %  9: LIFT PLACE
+        % 10: HOME
         S.key_poses = [
             H(1)  H(2)  H(3)           ORIENT_HOME;
             Pk(1) Pk(2) Pk(3)+Zc        ORIENT_APPROACH_PICK;
@@ -339,7 +481,6 @@ function kuka_pick_and_place_gui()
             H(1)  H(2)  H(3)           ORIENT_HOME;
         ];
 
-        % Generate dense waypoints with quintic smoothing between safe key poses
         ptsPerSeg = max(10, round(efPtsSeg.Value));
 
         W = [];
@@ -347,19 +488,17 @@ function kuka_pick_and_place_gui()
             p0 = S.key_poses(k,:);
             p1 = S.key_poses(k+1,:);
             s = linspace(0,1,ptsPerSeg).';
-            s5 = 6*s.^5 - 15*s.^4 + 10*s.^3;  % C2 smooth quintic
+            s5 = 6*s.^5 - 15*s.^4 + 10*s.^3;
             seg = p0 + (p1-p0).*s5;
             if isempty(W), W = seg; else, W = [W; seg(2:end,:)]; end %#ok<AGROW>
         end
 
-        % Post-process: clamp all interpolated orientations to safe ranges
         for wi = 1:size(W,1)
             W(wi,4:6) = safeOrientation(W(wi,4:6), C_TARGET);
         end
 
         S.waypoints = W;
 
-        % Workspace safety check
         radii = sqrt(sum(S.waypoints(:,1:3).^2,2));
         if max(radii) > S.max_reach
             error('Some waypoints unreachable (outside reach). Reduce distances.');
@@ -403,7 +542,6 @@ function kuka_pick_and_place_gui()
     end
 
     function drawPointsOnly()
-        % Points
         plot3(ax3d, S.home(1),S.home(2),S.home(3), 'ms','MarkerSize',12,'MarkerFaceColor','m');
         plot3(ax3d, S.pick(1),S.pick(2),S.pick(3), 'go','MarkerSize',12,'MarkerFaceColor','g');
         plot3(ax3d, S.place(1),S.place(2),S.place(3),'ro','MarkerSize',12,'MarkerFaceColor','r');
@@ -413,7 +551,7 @@ function kuka_pick_and_place_gui()
     end
 
     %% =====================================================================
-    %% EXECUTION (STREAMING)
+    %% EXECUTION (STREAMING) WITH VACUUM CONTROL
     %% =====================================================================
 
     function runStreaming()
@@ -427,17 +565,30 @@ function kuka_pick_and_place_gui()
         btnExecute.Enable = 'off';
         btnPreview.Enable = 'off';
         btnStop.Enable = 'on';
+        btnTestVacuum.Enable = 'off';
 
         dt = efDT.Value;
         pulse_ms = round(efPulseMs.Value);
+        ptsPerSeg = max(10, round(efPtsSeg.Value));
 
-        logMsg(sprintf('EXEC start: N=%d, dt=%.3fs, pulse=%dms', size(S.waypoints,1), dt, pulse_ms));
+        % Calculate waypoint indices for PICK (key pose 3) and PLACE (key pose 8)
+        PICK_WAYPOINT_IDX  = 1 + (3-1) * (ptsPerSeg - 1);
+        PLACE_WAYPOINT_IDX = 1 + (8-1) * (ptsPerSeg - 1);
+
+        logMsg(sprintf('EXEC start: N=%d, dt=%.3fs, pulse=%dms, vacuum=%s', ...
+            size(S.waypoints,1), dt, pulse_ms, mat2str(S.vacuum_enabled)));
+        if S.vacuum_enabled
+            logMsg(sprintf('  Vacuum ON at waypoint %d (PICK), OFF at %d (PLACE)', ...
+                PICK_WAYPOINT_IDX, PLACE_WAYPOINT_IDX));
+        end
+
+        % Ensure vacuum OFF before starting
+        setVacuum(false);
 
         % Prepare real-time telemetry plots
         jointColors = {'r','g','b','m','c',[0.8 0.5 0]};
         jointLabels = {'J1','J2','J3','J4','J5','J6'};
 
-        % --- Joint Torque ---
         cla(axTorque); grid(axTorque,'on'); hold(axTorque,'on');
         title(axTorque,'Joint Torque');
         hTorque = gobjects(1,6);
@@ -446,7 +597,6 @@ function kuka_pick_and_place_gui()
         end
         legend(axTorque,jointLabels,'Location','bestoutside','FontSize',7);
 
-        % --- Cartesian Position ---
         cla(axCartesian); grid(axCartesian,'on'); hold(axCartesian,'on');
         title(axCartesian,'Cartesian Position');
         hCartX = animatedline(axCartesian,'Color','r','LineWidth',1.5);
@@ -454,7 +604,6 @@ function kuka_pick_and_place_gui()
         hCartZ = animatedline(axCartesian,'Color','b','LineWidth',1.5);
         legend(axCartesian,{'X','Y','Z'},'Location','bestoutside','FontSize',7);
 
-        % --- Joint Velocity ---
         cla(axVelocity); grid(axVelocity,'on'); hold(axVelocity,'on');
         title(axVelocity,'Joint Velocity');
         hVelocity = gobjects(1,6);
@@ -463,7 +612,6 @@ function kuka_pick_and_place_gui()
         end
         legend(axVelocity,jointLabels,'Location','bestoutside','FontSize',7);
 
-        % --- Joint Current ---
         cla(axCurrent); grid(axCurrent,'on'); hold(axCurrent,'on');
         title(axCurrent,'Joint Current');
         hCurrent = gobjects(1,6);
@@ -472,7 +620,7 @@ function kuka_pick_and_place_gui()
         end
         legend(axCurrent,jointLabels,'Location','bestoutside','FontSize',7);
 
-        % Move to first waypoint (like your executor)
+        % Move to first waypoint
         p0 = S.waypoints(1,:);
         ok = sendE6Pos(S.tcp, p0, S.robot_s, S.robot_t);
         if ~ok
@@ -481,7 +629,7 @@ function kuka_pick_and_place_gui()
         end
         pulseMoveTrigger(S.tcp, pulse_ms);
 
-        pause(1.2); % allow robot to begin motion to start (same idea as your script)
+        pause(1.2);
 
         [S.robot_s,S.robot_t] = readSTFromPosAct(S.tcp,S.robot_s,S.robot_t);
         logMsg(sprintf('Start command issued. Controller S=%d, T=%d', S.robot_s, S.robot_t));
@@ -489,10 +637,10 @@ function kuka_pick_and_place_gui()
         % Streaming loop
         N = size(S.waypoints,1);
 
-        AXIS_POLL_RATE = max(1, round(0.30/dt)); % ~0.3s
-        ST_REFRESH_RATE = max(1, round(0.50/dt)); % ~0.5s
-        PLOT_RATE = max(1, round(0.10/dt)); % ~0.1s
-        TELEM_POLL_RATE = max(1, round(0.15/dt)); % ~150ms telemetry
+        AXIS_POLL_RATE = max(1, round(0.30/dt));
+        ST_REFRESH_RATE = max(1, round(0.50/dt));
+        PLOT_RATE = max(1, round(0.10/dt));
+        TELEM_POLL_RATE = max(1, round(0.15/dt));
 
         A4_GUARD = 170;
         A5_GUARD = 110;
@@ -504,8 +652,8 @@ function kuka_pick_and_place_gui()
         cartesian_log = nan(N,3);
         velocity_log = nan(N,6);
         current_log = nan(N,6);
+        vacuum_log = false(N,1);
 
-        % Last known telemetry values (for smooth real-time plotting)
         last_torque = nan(1,6);
         last_cartesian = nan(1,3);
         last_velocity = nan(1,6);
@@ -515,7 +663,8 @@ function kuka_pick_and_place_gui()
 
         for i = 1:N
             if S.stopRequested
-                finishExec('STOP pressed. Execution aborted.');
+                setVacuum(false);
+                finishExec('STOP pressed. Vacuum OFF. Aborted.');
                 return;
             end
 
@@ -529,7 +678,24 @@ function kuka_pick_and_place_gui()
             end
             pulseMoveTrigger(S.tcp, pulse_ms);
 
-            % Refresh S/T sometimes (controller-chosen)
+            % ===== VACUUM CONTROL AT KEY POSES (via $OUT[24]) =====
+            if S.vacuum_enabled
+                if i == PICK_WAYPOINT_IDX
+                    logMsg(sprintf('  [%d] $OUT[24]=TRUE — gripping...', i));
+                    setVacuum(true);
+                    gripWait(S.vacuum_grip_delay);
+                    logMsg(sprintf('  Grip delay %.1fs complete.', S.vacuum_grip_delay));
+
+                elseif i == PLACE_WAYPOINT_IDX
+                    logMsg(sprintf('  [%d] $OUT[24]=FALSE — releasing...', i));
+                    setVacuum(false);
+                    gripWait(S.vacuum_release_delay);
+                    logMsg(sprintf('  Release delay %.1fs complete.', S.vacuum_release_delay));
+                end
+            end
+            vacuum_log(i) = S.vacuum_is_on;
+
+            % Refresh S/T sometimes
             if mod(i, ST_REFRESH_RATE) == 0
                 [sNew,tNew] = readSTFromPosAct(S.tcp,S.robot_s,S.robot_t);
                 if sNew ~= S.robot_s || tNew ~= S.robot_t
@@ -538,63 +704,57 @@ function kuka_pick_and_place_gui()
                 end
             end
 
-            % Poll A4/A5 sometimes for guard + logging
+            % Poll A4/A5 for guard
             if mod(i, AXIS_POLL_RATE) == 0 || i==1 || i==N
                 [a4,a5] = readA4A5FromAxisAct(S.tcp);
                 a4_log(i)=a4; a5_log(i)=a5;
 
                 if ~isnan(a4) && abs(a4) > A4_GUARD
-                    logMsg(sprintf('A4 %.1f exceeds guard %.0f -> ABORT', a4, A4_GUARD));
-                    finishExec('A4 guard exceeded. Aborted.');
-                    saveExecLog(exec_sent,a4_log,a5_log,torque_log,cartesian_log,velocity_log,current_log);
+                    logMsg(sprintf('A4 %.1f exceeds guard -> ABORT + VACUUM OFF', a4));
+                    setVacuum(false);
+                    finishExec('A4 guard exceeded. Vacuum OFF. Aborted.');
+                    saveExecLog(exec_sent,a4_log,a5_log,torque_log,cartesian_log,velocity_log,current_log,vacuum_log);
                     return;
                 end
                 if ~isnan(a5) && abs(a5) > A5_GUARD
-                    logMsg(sprintf('A5 %.1f exceeds guard %.0f -> ABORT', a5, A5_GUARD));
-                    finishExec('A5 guard exceeded. Aborted.');
-                    saveExecLog(exec_sent,a4_log,a5_log,torque_log,cartesian_log,velocity_log,current_log);
+                    logMsg(sprintf('A5 %.1f exceeds guard -> ABORT + VACUUM OFF', a5));
+                    setVacuum(false);
+                    finishExec('A5 guard exceeded. Vacuum OFF. Aborted.');
+                    saveExecLog(exec_sent,a4_log,a5_log,torque_log,cartesian_log,velocity_log,current_log,vacuum_log);
                     return;
                 end
             end
 
-            % Poll real-time telemetry from robot
+            % Poll telemetry
             if mod(i, TELEM_POLL_RATE)==0 || i==1 || i==N
                 telem = readTelemetry(S.tcp);
-
                 if any(~isnan(telem.torque)), last_torque = telem.torque; end
                 torque_log(i,:) = telem.torque;
-
                 if any(~isnan(telem.cartesian)), last_cartesian = telem.cartesian; end
                 cartesian_log(i,:) = telem.cartesian;
-
                 if any(~isnan(telem.velocity)), last_velocity = telem.velocity; end
                 velocity_log(i,:) = telem.velocity;
-
                 if any(~isnan(telem.current)), last_current = telem.current; end
                 current_log(i,:) = telem.current;
             end
 
-            % Plot updates (uses last known values for smooth display)
+            % Plot updates
             if mod(i, PLOT_RATE)==0 || i==N
-                % Joint Torque
                 for jj = 1:6
                     if ~isnan(last_torque(jj))
                         addpoints(hTorque(jj), i, last_torque(jj));
                     end
                 end
-                % Cartesian Position
                 if ~isnan(last_cartesian(1))
                     addpoints(hCartX, i, last_cartesian(1));
                     addpoints(hCartY, i, last_cartesian(2));
                     addpoints(hCartZ, i, last_cartesian(3));
                 end
-                % Joint Velocity
                 for jj = 1:6
                     if ~isnan(last_velocity(jj))
                         addpoints(hVelocity(jj), i, last_velocity(jj));
                     end
                 end
-                % Joint Current
                 for jj = 1:6
                     if ~isnan(last_current(jj))
                         addpoints(hCurrent(jj), i, last_current(jj));
@@ -603,19 +763,30 @@ function kuka_pick_and_place_gui()
                 drawnow limitrate;
             end
 
-            % Maintain dt (do not use long pauses; just hold loop to dt)
+            % Maintain dt
             while toc(tStep) < dt
                 drawnow limitrate;
                 if S.stopRequested, break; end
             end
         end
 
+        % Ensure vacuum OFF after trajectory
+        setVacuum(false);
+
         elapsed = toc(tStart);
-        saveExecLog(exec_sent,a4_log,a5_log,torque_log,cartesian_log,velocity_log,current_log);
-        finishExec(sprintf('EXEC completed. Time=%.1fs', elapsed));
+        saveExecLog(exec_sent,a4_log,a5_log,torque_log,cartesian_log,velocity_log,current_log,vacuum_log);
+        finishExec(sprintf('EXEC completed. Time=%.1fs. Vacuum OFF.', elapsed));
     end
 
-    function saveExecLog(exec_sent,a4_log,a5_log,torque_log,cartesian_log,velocity_log,current_log)
+    function gripWait(seconds)
+        t0 = tic;
+        while toc(t0) < seconds
+            drawnow limitrate;
+            if S.stopRequested, break; end
+        end
+    end
+
+    function saveExecLog(exec_sent,a4_log,a5_log,torque_log,cartesian_log,velocity_log,current_log,vacuum_log)
         timestamp = datestr(now,'yyyymmdd_HHMMSS');
         fname = sprintf('execution_log_gui_%s.mat', timestamp);
         execution_log = struct();
@@ -631,6 +802,10 @@ function kuka_pick_and_place_gui()
         execution_log.cartesian_log = cartesian_log;
         execution_log.velocity_log = velocity_log;
         execution_log.current_log = current_log;
+        execution_log.vacuum_log = vacuum_log;
+        execution_log.vacuum_enabled = S.vacuum_enabled;
+        execution_log.vacuum_grip_delay = S.vacuum_grip_delay;
+        execution_log.vacuum_release_delay = S.vacuum_release_delay;
         execution_log.dt = efDT.Value;
         execution_log.pulse_ms = round(efPulseMs.Value);
         save(fname,'execution_log');
@@ -642,6 +817,7 @@ function kuka_pick_and_place_gui()
         btnExecute.Enable = S.connected;
         btnPreview.Enable = 'on';
         btnStop.Enable = 'off';
+        btnTestVacuum.Enable = S.connected;
         logMsg(msg);
     end
 
@@ -673,35 +849,27 @@ function kuka_pick_and_place_gui()
     end
 
     %% =====================================================================
-    %% ORIENTATION SAFETY (A4/A5 limit avoidance)
+    %% ORIENTATION SAFETY (UNCHANGED — your proven working version)
     %% =====================================================================
 
     function abc = safeOrientation(abc_in, c_target)
-        % Dynamically constrain A/B/C to avoid A4/A5 software limit switches.
-        %   A -> normalized toward -180 for consistent wrist configuration
-        %   B -> clamped to [-3, 3] to prevent A5 excursion
-        %   C -> kept near c_target (default -179.90), never exactly ±180
-        % Values are NOT fixed; they are gently constrained to a safe zone.
         if nargin < 2, c_target = -179.90; end
 
         a = abc_in(1);
         b = abc_in(2);
         c = abc_in(3);
 
-        % --- A: normalize toward -180 to keep A4 stable ---
-        a = mod(a + 180, 360) - 180;       % wrap to [-180, 180)
-        if a > 0, a = a - 360; end         % force negative side
-        a = max(-180, a);                   % floor at -180
-        if a > -175, a = -180; end          % pull drifted values back
-        if a <= -180, a = -179.99; end      % avoid exact -180 singularity
+        a = mod(a + 180, 360) - 180;
+        if a > 0, a = a - 360; end
+        a = max(-180, a);
+        if a > -175, a = -180; end
+        if a <= -180, a = -179.99; end
 
-        % --- B: clamp small to avoid A5 excursion ---
         b = max(-3, min(3, b));
 
-        % --- C: keep near c_target, avoid ±180 singularity ---
-        c = mod(c + 180, 360) - 180;       % wrap to [-180, 180)
-        if abs(c) >= 180, c = c_target; end % avoid exact ±180
-        if abs(c - c_target) > 1.5          % cap deviation from target
+        c = mod(c + 180, 360) - 180;
+        if abs(c) >= 180, c = c_target; end
+        if abs(c - c_target) > 1.5
             c = c_target + sign(c - c_target) * 0.5;
         end
 
@@ -709,21 +877,18 @@ function kuka_pick_and_place_gui()
     end
 
     %% =====================================================================
-    %% ROBOT COMMS (PROVEN STYLE)
+    %% ROBOT COMMS (UNCHANGED — your proven working version)
     %% =====================================================================
 
     function ok = sendE6Pos(tcp, pose6, ~, ~)
-        % Keep it A4-safe: do not force S/T in the string.
         posStr = sprintf('{X %.3f,Y %.3f,Z %.3f,A %.3f,B %.3f,C %.3f}', ...
             pose6(1), pose6(2), pose6(3), pose6(4), pose6(5), pose6(6));
         ok = writeVar(tcp,'target_pos',posStr);
     end
 
     function pulseMoveTrigger(tcp, pulse_ms)
-        % CRITICAL: KRL cyclic code often MISSES a 0ms pulse.
-        % Use a real pulse width (e.g. 12ms).
         writeVar(tcp,'move_trigger','TRUE');
-        pause(max(0.003, pulse_ms/1000)); % >=3ms
+        pause(max(0.003, pulse_ms/1000));
         writeVar(tcp,'move_trigger','FALSE');
     end
 
@@ -757,25 +922,12 @@ function kuka_pick_and_place_gui()
     end
 
     function telem = readTelemetry(tcp)
-        % Reads telemetry from KUKA via KUKAVARPROXY.
-        % Uses individual array element reads (proven working approach).
-        %
-        % KUKA system variables:
-        %   $TORQUE_AXIS_ACT[i]  - joint torque (% of max)
-        %   $VEL_AXIS_ACT[i]     - joint velocity (% of max)
-        %   $CURR_ACT[i]         - motor current (A)
-        %   $POS_ACT             - Cartesian position (E6POS struct)
-        %   $AXIS_ACT            - joint angles (E6AXIS struct)
-        %
-        % Fallback: $TORMON_DAT[i].TORQUE_ACT for some KRC versions.
-
         telem = struct();
         telem.torque  = nan(1,6);
         telem.velocity = nan(1,6);
         telem.current  = nan(1,6);
         telem.cartesian = nan(1,3);
 
-        % --- Torques: $TORQUE_AXIS_ACT[i] (KRC4) ---
         torque_read = false;
         try
             for j = 1:6
@@ -787,7 +939,6 @@ function kuka_pick_and_place_gui()
             end
         catch
         end
-        % Fallback: $TORMON_DAT[i].TORQUE_ACT
         if ~torque_read
             try
                 for j = 1:6
@@ -800,7 +951,6 @@ function kuka_pick_and_place_gui()
             end
         end
 
-        % --- Velocities: $VEL_AXIS_ACT[i] ---
         try
             for j = 1:6
                 val = readVar(tcp, sprintf('$VEL_AXIS_ACT[%d]', j));
@@ -811,7 +961,6 @@ function kuka_pick_and_place_gui()
         catch
         end
 
-        % --- Motor currents: $CURR_ACT[i] ---
         try
             for j = 1:6
                 val = readVar(tcp, sprintf('$CURR_ACT[%d]', j));
@@ -822,7 +971,6 @@ function kuka_pick_and_place_gui()
         catch
         end
 
-        % --- Cartesian position: $POS_ACT (E6POS struct string) ---
         try
             result = readVar(tcp, '$POS_ACT');
             if ischar(result) || isstring(result)
@@ -839,8 +987,39 @@ function kuka_pick_and_place_gui()
         end
     end
 
+    function text = boolToKRL(value)
+        if value
+            text = 'TRUE';
+        else
+            text = 'FALSE';
+        end
+    end
+
+    function value = readBoolVar(tcp,varName)
+        value = [];
+        raw = readVar(tcp,varName);
+
+        if islogical(raw)
+            value = raw;
+            return;
+        end
+
+        if isnumeric(raw) && ~isnan(raw)
+            value = raw ~= 0;
+            return;
+        end
+
+        if ischar(raw) || isstring(raw)
+            rawText = upper(strtrim(char(raw)));
+            if strcmp(rawText,'TRUE')
+                value = true;
+            elseif strcmp(rawText,'FALSE')
+                value = false;
+            end
+        end
+    end
+
     function success = writeVar(tcp,varName,varValue)
-        % This matches your working scripts style (small post-write pause)
         success = false;
         try
             msgId = uint16(1);
@@ -865,7 +1044,6 @@ function kuka_pick_and_place_gui()
 
             write(tcp,msg);
 
-            % give proxy time
             pause(0.008);
 
             success = true;

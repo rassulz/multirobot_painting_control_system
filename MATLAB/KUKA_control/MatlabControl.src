@@ -1,9 +1,9 @@
 &ACCESS RVP
 &REL 4
 DEF MatlabControl()
-    DECL INT I           ; 
+    DECL INT I
 
-    WAIT FOR $MOVE_ENABLE     ; Safety: wait for drives enabled & mode ok
+    WAIT FOR $MOVE_ENABLE
 
     ; Safe init - resets defaults
     BAS(#INITMOV,0)
@@ -14,26 +14,32 @@ DEF MatlabControl()
         $ACC_AXIS[I] = 100
     ENDFOR
 
-    PTP XHOME                 ; Move to home (assuming XHOME is declared somewhere)
+    ; Safe init for the vacuum command path
+    vacuum_cmd = FALSE
+    $OUT[24] = FALSE
+
+    PTP XHOME
 
     ; Main loop
     LOOP
-        WAIT FOR $MOVE_ENABLE   ; Re-check safety
+        ; Mirror the MATLAB BOOL command to the physical output.
+        ; This keeps KUKAVARPROXY writes on a simple global variable.
+        $OUT[24] = vacuum_cmd
 
-        IF move_trigger THEN
+        IF $MOVE_ENABLE AND move_trigger THEN
             ; fast move (100%)
             FOR I = 1 TO 6
                 $VEL_AXIS[I] = 100
                 $ACC_AXIS[I] = 100
             ENDFOR
 
-            ; Tiny settle time for motion planner (helps stability)
+            ; Tiny settle time for motion planner
             WAIT SEC 0.02
 
             PTP target_pos
             move_trigger = FALSE
         ENDIF
 
-        WAIT SEC 0.01              ; CPU-friendly delay
+        WAIT SEC 0.01
     ENDLOOP
 END

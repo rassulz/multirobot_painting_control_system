@@ -115,6 +115,24 @@ function T = buildKukaPositionTable(kukaCsvPath)
         error('KUKA CSV missing required columns: %s', strjoin(missing, ', '));
     end
 
+    keep = true(height(src), 1);
+    if ismember('run_status', src.Properties.VariableNames)
+        keep = keep & (string(src.run_status) == "completed");
+    end
+    if ismember('telem_fresh', src.Properties.VariableNames)
+        keep = keep & (src.telem_fresh > 0);
+    end
+    if ismember('meas_valid', src.Properties.VariableNames)
+        keep = keep & (src.meas_valid > 0);
+    end
+
+    src = src(keep, :);
+    if isempty(src)
+        warning('No usable KUKA rows remain after filtering: %s', kukaCsvPath);
+        T = emptyPositionTable();
+        return;
+    end
+
     n = height(src);
     robot = repmat({'kuka'}, n, 1);
     arm_id = repmat({'kuka_main'}, n, 1);
@@ -175,6 +193,8 @@ end
 function T = collectRoarmSynthetic(cfg)
     records = [];
     runBase = datestr(now, 'yyyymmdd_HHMMSS');
+    sigma = [1.5, 1.5, 1.0];
+    limits = [120, 340; -220, 220; 80, 260];
 
     for a = 1:numel(cfg.roarmIps)
         armTag = sprintf('roarm_%d', a);
@@ -183,14 +203,16 @@ function T = collectRoarmSynthetic(cfg)
         for ep = 1:cfg.roarmEpisodes
             waypoints = generateRoarmWaypoints(cfg.roarmStepsPerEp);
             run_id = sprintf('%s_%s_ep%02d', runBase, armTag, ep);
+            prevMeas = waypoints(1,:) + randn(1,3) .* sigma;
+            prevMeas = clampToLimits(prevMeas, limits);
 
             for k = 1:size(waypoints,1)
                 stepGlobal = stepGlobal + 1;
                 t = (stepGlobal - 1) * cfg.roarmDt;
                 target = waypoints(k,:);
 
-                % Synthetic measured pose with small sensor/motion noise.
-                meas = target + randn(1,3) .* [1.5, 1.5, 1.0];
+                meas = simulateRoarmTracking(prevMeas, target, cfg.roarmDt, sigma, limits);
+                prevMeas = meas;
                 records = [records; makeRow(run_id, 'roarm', armTag, stepGlobal, t, target, meas, cfg.roarmDt)]; %#ok<AGROW>
             end
         end
@@ -363,4 +385,17 @@ end
 
 function y = clamp(x, lo, hi)
     y = min(max(x, lo), hi);
+end
+
+function meas = simulateRoarmTracking(prevMeas, target, dt, sigma, limits)
+    tau = 0.15;
+    alpha = 1 - exp(-dt / tau);
+    meas = prevMeas + alpha * (target - prevMeas) + randn(1,3) .* sigma;
+    meas = clampToLimits(meas, limits);
+end
+
+function xyz = clampToLimits(xyz, limits)
+    xyz(1) = clamp(xyz(1), limits(1,1), limits(1,2));
+    xyz(2) = clamp(xyz(2), limits(2,1), limits(2,2));
+    xyz(3) = clamp(xyz(3), limits(3,1), limits(3,2));
 end

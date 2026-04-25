@@ -72,6 +72,7 @@ fprintf('       Place: [%.0f, %.0f, %.0f] mm\n', place_pt);
 
 % --- Feature: tracking error (mm) ---
 tracking_error = vecnorm(target_xyz - meas_xyz, 2, 2);
+tracking_error = sanitizeVector(tracking_error);
 
 % --- Feature: end-effector velocity (mm/s) ---
 ee_velocity = zeros(N,1);
@@ -79,6 +80,7 @@ for k = 2:N
     ee_velocity(k) = norm(target_xyz(k,:) - target_xyz(k-1,:)) / dt;
 end
 ee_velocity(1) = ee_velocity(2);
+ee_velocity = sanitizeVector(ee_velocity);
 
 % --- Feature: end-effector acceleration (mm/s²) ---
 ee_accel = zeros(N,1);
@@ -86,6 +88,7 @@ for k = 2:N
     ee_accel(k) = (ee_velocity(k) - ee_velocity(k-1)) / dt;
 end
 ee_accel(1) = ee_accel(2);
+ee_accel = sanitizeVector(ee_accel);
 
 % --- Feature: jerk (mm/s³)  — key for smooth motion ---
 jerk = zeros(N,1);
@@ -93,6 +96,7 @@ for k = 2:N
     jerk(k) = (ee_accel(k) - ee_accel(k-1)) / dt;
 end
 jerk(1) = jerk(2);
+jerk = sanitizeVector(jerk);
 
 % --- Feature: path curvature (rad) ---
 curvature = zeros(N,1);
@@ -104,16 +108,21 @@ for k = 3:N
         curvature(k) = acos(max(-1, min(1, dot(v1,v2)/(n1*n2))));
     end
 end
+curvature = sanitizeVector(curvature);
 
 % --- Feature: joint torque magnitude (Nm aggregate) ---
 torques = [data.torque_j1, data.torque_j2, data.torque_j3, ...
            data.torque_j4, data.torque_j5, data.torque_j6];
+torques = sanitizeMatrix(torques);
 torque_mag = vecnorm(torques, 2, 2);
+torque_mag = sanitizeVector(torque_mag);
 
 % --- Feature: joint current magnitude (energy proxy) ---
 currents = [data.current_j1, data.current_j2, data.current_j3, ...
             data.current_j4, data.current_j5, data.current_j6];
+currents = sanitizeMatrix(currents);
 curr_mag = vecnorm(currents, 2, 2);
+curr_mag = sanitizeVector(curr_mag);
 
 % --- Feature: progress along trajectory (0→1) ---
 cum_path = zeros(N,1);
@@ -121,10 +130,13 @@ for k = 2:N
     cum_path(k) = cum_path(k-1) + norm(target_xyz(k,:)-target_xyz(k-1,:));
 end
 progress = cum_path / max(cum_path(end), 1e-6);
+progress = sanitizeVector(progress);
 
 % --- Feature: distance to pick / distance to place ---
 dist_to_pick  = vecnorm(target_xyz - pick_pt,  2, 2);
 dist_to_place = vecnorm(target_xyz - place_pt, 2, 2);
+dist_to_pick = sanitizeVector(dist_to_pick);
+dist_to_place = sanitizeVector(dist_to_place);
 
 % --- Feature: payload phase ---
 %  Near pick point = approaching/grasping, near place = releasing
@@ -132,6 +144,8 @@ dist_to_place = vecnorm(target_xyz - place_pt, 2, 2);
 total_dist    = norm(place_pt - pick_pt);
 norm_to_pick  = dist_to_pick  / total_dist;
 norm_to_place = dist_to_place / total_dist;
+norm_to_pick = sanitizeVector(norm_to_pick);
+norm_to_place = sanitizeVector(norm_to_place);
 
 % --- Pack into struct ---
 F.tracking_error = tracking_error;
@@ -493,4 +507,16 @@ function net = createCriticNet(obsDim, actDim)
     lg = connectLayers(lg, 'sr1', 'add/in1');
     lg = connectLayers(lg, 'ar1', 'add/in2');
     net = dlnetwork(lg);
+end
+
+function x = sanitizeVector(x)
+    x = fillmissing(x, 'previous');
+    x = fillmissing(x, 'next');
+    x(~isfinite(x)) = 0;
+end
+
+function X = sanitizeMatrix(X)
+    for ii = 1:size(X, 2)
+        X(:,ii) = sanitizeVector(X(:,ii));
+    end
 end

@@ -254,15 +254,24 @@ end
 function runScriptIsolated(folder, scriptName)
 % Runs a script that calls 'clear' inside a function scope so 'clear'
 % only wipes this wrapper's scope, not the pipeline's workspace.
-    old = pwd;
-    cd(folder);
-    try
-        run(scriptName);
-    catch ME
-        cd(old);
-        rethrow(ME);
+    scriptPath = fullfile(folder, [scriptName '.m']);
+    if ~isfile(scriptPath)
+        error('Script not found: %s', scriptPath);
     end
-    cd(old);
+
+    runPath = which('run');
+    builtinRunPath = fullfile(matlabroot, 'toolbox', 'matlab', 'lang', 'run.m');
+    if isempty(runPath)
+        fprintf('  ! Warning: MATLAB run() could not be resolved on the path.\n');
+    elseif ~strcmpi(runPath, builtinRunPath)
+        fprintf('  ! Warning: MATLAB run() is shadowed by: %s\n', runPath);
+        fprintf('    Executing script directly by name to avoid the conflict.\n');
+    end
+
+    old = pwd;
+    cleanupObj = onCleanup(@() cd(old)); %#ok<NASGU>
+    cd(folder);
+    eval(scriptName);
 end
 
 function cfg = fillPipelineDefaults(cfg)

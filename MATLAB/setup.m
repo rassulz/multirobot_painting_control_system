@@ -33,6 +33,18 @@ for i = 1:numel(dirsToAdd)
 end
 fprintf('\n');
 
+% --- Warn if MATLAB run() is shadowed by a project file ---
+runPath = which('run');
+builtinRunPath = fullfile(matlabroot, 'toolbox', 'matlab', 'lang', 'run.m');
+if isempty(runPath)
+    fprintf('=== Checking MATLAB Runtime Helpers ===\n');
+    fprintf('  x Cannot resolve MATLAB run() on the current path.\n\n');
+elseif ~strcmpi(runPath, builtinRunPath)
+    fprintf('=== Checking MATLAB Runtime Helpers ===\n');
+    fprintf('  ! Warning: run() is shadowed by: %s\n', runPath);
+    fprintf('    Pipeline uses direct script execution, so this is non-fatal.\n\n');
+end
+
 % --- Verify critical functions ---
 required_functions = {
     'run_full_multirobot_pipeline'       % Unified pipeline

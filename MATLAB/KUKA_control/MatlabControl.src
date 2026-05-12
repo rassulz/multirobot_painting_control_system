@@ -14,16 +14,19 @@ DEF MatlabControl()
         $ACC_AXIS[I] = 100
     ENDFOR
 
-    ; Safe init for the vacuum command path
+    ; Safe init for the magnetic command path
+    magnetic_cmd = FALSE
     vacuum_cmd = FALSE
+    $OUT[25] = FALSE
     $OUT[24] = FALSE
 
     PTP XHOME
 
     ; Main loop
     LOOP
-        ; Mirror the MATLAB BOOL command to the physical output.
+        ; Mirror the MATLAB magnetic BOOL command to the physical output.
         ; This keeps KUKAVARPROXY writes on a simple global variable.
+        $OUT[25] = magnetic_cmd
         $OUT[24] = vacuum_cmd
 
         IF $MOVE_ENABLE AND move_trigger THEN

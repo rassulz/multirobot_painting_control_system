@@ -38,9 +38,9 @@ function cfg = buildConfig()
 
     % ============ OBJECT DIMENSIONS ============
     % Physical object: 10.5cm x 21cm x 7.5cm
-    cfg.OBJ_DX    = 105;   % Width along X (fits conveyor width)
-    cfg.OBJ_DY    = 210;   % Length along Y (along conveyor direction)
-    cfg.OBJ_DZ    = 75;    % Height (Z)
+    cfg.OBJ_DX    = 90;   % Width along X (fits conveyor width)
+    cfg.OBJ_DY    = 200;   % Length along Y (along conveyor direction)
+    cfg.OBJ_DZ    = 80;    % Height (Z)
 
     cfg.OBJ_CX    = cfg.CONV_CX;    % centered on conveyor X
     cfg.OBJ_Z0    = cfg.CONV_DZ;    % sits on top of conveyor
@@ -53,14 +53,19 @@ function cfg = buildConfig()
     cfg.STRIPE_H  = 10;
     cfg.APPROACH  = 10;
     cfg.PAINT_SPD = 5.0;
-    cfg.IP1       = '192.168.1.192';
-    cfg.IP2       = '192.168.1.101';
+    cfg.IP1       = '172.31.17.192';
+    cfg.IP2       = '172.31.17.101';
     cfg.BASE_URL  = '/js?json=';
     cfg.HTTP_TO   = 0.8;
     cfg.READ_TO   = 0.3;
     cfg.MAX_RET   = 1;
     cfg.RET_DLY   = 0.05;
     cfg.POLL_INT  = 0.15;
+
+    % --- Gripper angle during Cartesian motion commands (radians) ---
+    % Keep the gripper 15 degrees open from the fully closed position.
+    cfg.MOTION_GRIPPER_OPEN_OFFSET_DEG = 15;
+    cfg.MOTION_GRIPPER_ANGLE_RAD = pi - deg2rad(cfg.MOTION_GRIPPER_OPEN_OFFSET_DEG);
 
     % --- NEW: motion settling parameters ---
     cfg.SETTLE_TOL     = 5.0;    % mm tolerance to consider "arrived"
@@ -464,7 +469,7 @@ function torques = computeStaticTorques(theta2, theta3, cfg)
 end
 
 %% ================================================================
-%  SECTION: HTTP COMMUNICATION (UNCHANGED)
+%  SECTION: HTTP COMMUNICATION
 %% ================================================================
 function [resp, success] = httpSend(ip, baseURL, jsonCmd, timeout, maxRet, retDly)
     url = ['http://' char(ip) char(baseURL) urlencode(jsonCmd)];
@@ -758,10 +763,16 @@ end
 %  SECTION: EXECUTE PATH (IMPROVED)
 %  Now waits for each waypoint arrival before proceeding
 %% ================================================================
-function executePath(ip, pathG, armIdx, cfg, fig, label)
+function success = executePath(ip, pathG, armIdx, cfg, fig, label)
     n = size(pathG, 1);
     logMsg(fig, sprintf('[%s] Starting %d waypoints', label, n));
-    h = fig.UserData;
+    success = false;
+
+    if n == 0
+        logMsg(fig, sprintf('[%s] No waypoints to execute', label));
+        success = true;
+        return
+    end
 
     skipped = 0;
     failed  = 0;
@@ -788,8 +799,11 @@ function executePath(ip, pathG, armIdx, cfg, fig, label)
         end
 
         spd = h.eSpeed.Value;
-        cmd = sprintf('{"T":104,"x":%d,"y":%d,"z":%d,"t":0,"spd":%.2f}', ...
-            round(lx), round(ly), round(lz), spd);
+        cmd = sprintf('{"T":104,"x":%d,"y":%d,"z":%d,"t":%.4f,"spd":%.2f}', ...
+            round(lx), round(ly), round(lz), cfg.MOTION_GRIPPER_ANGLE_RAD, spd);
+        if i == 1
+            logMsg(fig, sprintf('[%s] First motion cmd: %s', label, cmd));
+        end
         [~, success] = httpSend(ip, cfg.BASE_URL, cmd, cfg.HTTP_TO, cfg.MAX_RET, cfg.RET_DLY);
 
         if ~success
@@ -846,6 +860,7 @@ function executePath(ip, pathG, armIdx, cfg, fig, label)
 
     logMsg(fig, sprintf('[%s] Complete — %d sent, %d skipped, %d failed', ...
         label, n - skipped - failed, skipped, failed));
+    success = true;
 end
 
 %% ================================================================
@@ -1034,8 +1049,9 @@ function cbMove(fig, armIdx, cfg)
     lblIK.FontColor = [0.0 0.6 0.0];
 
     spd = h.eSpeed.Value;
-    cmd = sprintf('{"T":104,"x":%d,"y":%d,"z":%d,"t":0,"spd":%.2f}', ...
-        round(lx), round(ly), round(lz), spd);
+    cmd = sprintf('{"T":104,"x":%d,"y":%d,"z":%d,"t":%.4f,"spd":%.2f}', ...
+        round(lx), round(ly), round(lz), cfg.MOTION_GRIPPER_ANGLE_RAD, spd);
+    logMsg(fig, sprintf('[ARM%d] Motion cmd: %s', armIdx, cmd));
     [resp, success] = httpSend(ip, cfg.BASE_URL, cmd, cfg.HTTP_TO, cfg.MAX_RET, cfg.RET_DLY);
 
     if ~success
@@ -1086,18 +1102,35 @@ function cbPing(fig, cfg)
     fig.UserData = h;
 end
 
-function cbHome(fig, cfg)
+function success = cbHome(fig, cfg)
     h = fig.UserData;
-    httpSend(h.eIP1.Value, cfg.BASE_URL, '{"T":100}', ...
+    success = true;
+
+    [~, arm1home] = httpSend(h.eIP1.Value, cfg.BASE_URL, '{"T":100}', ...
         cfg.HTTP_TO, cfg.MAX_RET, cfg.RET_DLY);
-    httpSend(h.eIP2.Value, cfg.BASE_URL, '{"T":100}', ...
+    [~, arm2home] = httpSend(h.eIP2.Value, cfg.BASE_URL, '{"T":100}', ...
         cfg.HTTP_TO, cfg.MAX_RET, cfg.RET_DLY);
+
     logMsg(fig, '[System] HOME command sent to both arms');
+    if ~arm1home
+        logMsg(fig, '[ARM1 Home] No HTTP ack for HOME; continuing');
+    end
+    if ~arm2home
+        logMsg(fig, '[ARM2 Home] No HTTP ack for HOME; continuing');
+    end
 end
 
-function homeOneArm(ip, cfg)
-    httpSend(ip, cfg.BASE_URL, '{"T":100}', ...
+function success = homeOneArm(ip, cfg, fig, label)
+    [~, homeSuccess] = httpSend(ip, cfg.BASE_URL, '{"T":100}', ...
         cfg.HTTP_TO, cfg.MAX_RET, cfg.RET_DLY);
+
+    if ~homeSuccess
+        logMsg(fig, sprintf('[%s] No HTTP ack for HOME; continuing', label));
+    else
+        logMsg(fig, sprintf('[%s] HOME command sent', label));
+    end
+
+    success = true;
 end
 
 function cbTel(fig, cfg)
@@ -1212,11 +1245,11 @@ function cbStart(fig, cfg)
     paths1 = generateStationPaths(cfg, 1);
     executePath(ip1, paths1.arm1, 1, cfg, fig, 'S1-ARM1-Front');
     logMsg(fig, '  ARM1 done -> HOME (collision avoidance)');
-    homeOneArm(ip1, cfg);
+    homeOneArm(ip1, cfg, fig, 'S1-ARM1-Home');
     pause(1.0);
     executePath(ip2, paths1.arm2, 2, cfg, fig, 'S1-ARM2-Front');
     logMsg(fig, '  ARM2 done -> HOME (collision avoidance)');
-    homeOneArm(ip2, cfg);
+    homeOneArm(ip2, cfg, fig, 'S1-ARM2-Home');
     pause(1.0);
 
     logMsg(fig, sprintf('--- Station 1 done. Conveyor moving to Station 2 (%ds) ---', cfg.STATION_WAIT));
@@ -1236,11 +1269,11 @@ function cbStart(fig, cfg)
     paths2 = generateStationPaths(cfg, 2);
     executePath(ip1, paths2.arm1, 1, cfg, fig, 'S2-ARM1-Side+Top');
     logMsg(fig, '  ARM1 done -> HOME (collision avoidance)');
-    homeOneArm(ip1, cfg);
+    homeOneArm(ip1, cfg, fig, 'S2-ARM1-Home');
     pause(1.0);
     executePath(ip2, paths2.arm2, 2, cfg, fig, 'S2-ARM2-Side+Top');
     logMsg(fig, '  ARM2 done -> HOME (collision avoidance)');
-    homeOneArm(ip2, cfg);
+    homeOneArm(ip2, cfg, fig, 'S2-ARM2-Home');
     pause(1.0);
 
     logMsg(fig, sprintf('--- Station 2 done. Conveyor moving to Station 3 (%ds) ---', cfg.STATION_WAIT));
@@ -1260,11 +1293,11 @@ function cbStart(fig, cfg)
     paths3 = generateStationPaths(cfg, 3);
     executePath(ip1, paths3.arm1, 1, cfg, fig, 'S3-ARM1-Back');
     logMsg(fig, '  ARM1 done -> HOME (collision avoidance)');
-    homeOneArm(ip1, cfg);
+    homeOneArm(ip1, cfg, fig, 'S3-ARM1-Home');
     pause(1.0);
     executePath(ip2, paths3.arm2, 2, cfg, fig, 'S3-ARM2-Back');
     logMsg(fig, '  ARM2 done -> HOME (collision avoidance)');
-    homeOneArm(ip2, cfg);
+    homeOneArm(ip2, cfg, fig, 'S3-ARM2-Home');
     pause(1.0);
 
     h = fig.UserData;
@@ -1287,13 +1320,16 @@ function cbStop(fig, cfg)
 end
 
 function logMsg(fig, msg)
+    ts = datestr(now, 'HH:MM:SS'); %#ok<TNOW1,DATST>
+    line = ['[' ts ']  ' msg];
+    fprintf('%s\n', line);
+
     h = fig.UserData;
     if ~isfield(h,'log') || ~isvalid(h.log), return; end
 
-    ts = datestr(now, 'HH:MM:SS'); %#ok<TNOW1,DATST>
     cur = h.log.Value;
     if ischar(cur), cur = {cur}; end
-    h.log.Value = [cur; {['[' ts ']  ' msg]}];
+    h.log.Value = [cur; {line}];
 
     try; scroll(h.log, 'bottom'); catch; end
     drawnow limitrate;

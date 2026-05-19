@@ -29,8 +29,8 @@ function kuka_pick_and_place_gui_magnetic()
 
     % Default poses (mm / deg) - A4/A5-safe orientation
     S.home  = [550  0   650   -180  0.5  -179.90];
-    S.pick  = [608  117 263   -180  0.5  -179.90];
-    S.place = [45   204 204   -180  0.5  -179.90];
+    S.pick  = [534 27 248   -180  0.5  -179.90];
+    S.place = [684 349 215   -180  0.5  -179.90];
 
     % Connection
     S.robot_ip = '172.31.17.101';

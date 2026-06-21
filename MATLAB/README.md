@@ -1,50 +1,51 @@
-# RoArm-M2-S Configuration and MATLAB Control via WiFi/HTTP
+# MATLAB Supervisory Layer
 
-## Overview
-This README provides step-by-step instructions to configure one or more **RoArm-M2-S** robotic arms and control them directly from **MATLAB** using WiFi and HTTP-based commands. The provided MATLAB script demonstrates reading status and controlling joint positions, Cartesian coordinates, and gripper for single or dual arms.
+This directory contains the **MATLAB-based supervisory control layer** of the multirobot painting system. It is the high-level tier of the [three-tier architecture](../README.md): it generates motion trajectories, coordinates the robots within one painting cycle, exchanges safety handshakes with the PLC, and visualizes real-time telemetry.
 
-The RoArm-M2-S supports two WiFi modes:  
-- **AP Mode** (default): Each arm creates its own hotspot.  
-- **STA Mode** (recommended for multi-arm or integrated setups): Arms connect to your existing router/hotspot, allowing all devices (PC + arms) to be on the same network.
+MATLAB does **not** replace the PLC — the Siemens S7-1500 remains responsible for deterministic sequencing and safety interlocks. Instead, MATLAB adds the flexible, computation-heavy capabilities (trajectory planning, kinematics, multi-robot coordination, monitoring) that are awkward to implement in ladder logic.
 
-For MATLAB integration in a multi-robot painting system, **STA mode is strongly recommended**.
+## Modules
 
-## Hardware Requirements
-- RoArm-M2-S robotic arm(s)
-- Power supply for each arm
-- WiFi router or hotspot (for STA mode)
-- Computer running MATLAB (R2019b or later recommended, with `webread` and `weboptions` support)
+| Module | Robot | Transport | Purpose |
+|---|---|---|---|
+| [`KUKA_control/`](KUKA_control/README.md) | KUKA KR10 R1100-2 (6-DOF) | TCP/IP via **KukaVarProxy** (port 7000) | Pick-and-place of finished parts; quintic-smoothstep trajectories streamed at ~83 Hz with live telemetry, joint-limit guards, and a magnetic/vacuum end-effector |
+| [`Roarm_control/`](Roarm_control/README.md) | 2× Waveshare RoArm-M2-S (4-DOF) | **HTTP/JSON** over Wi-Fi | Simultaneous spray painting; object-oriented control classes and a dual-arm painting application with reachability checks and telemetry |
 
-## Step 1: Power On the RoArm-M2-S
-1. Connect the power adapter to the RoArm-M2-S.
-2. Turn on the arm using the power switch.
-3. Wait ~20 seconds for boot-up.
-4. The **OLED display** will show the current WiFi mode and IP address.
+## How it fits together
 
-## Step 2: Configure WiFi in STA Mode (Recommended)
-By default, the arm is in AP mode (SSID: `RoArm-M2`, Password: `12345678`, IP: `192.168.4.1`).
+```
+            ┌──────────────────────────────────────────┐
+            │            MATLAB R2025b host              │
+            │                                            │
+            │   KUKA_control/        Roarm_control/      │
+            │   (pick & place)       (painting)          │
+            └───────┬──────────────────────┬─────────────┘
+                    │ TCP/IP               │ HTTP/JSON
+                    │ KukaVarProxy         │ Wi-Fi
+              ┌─────▼─────┐          ┌─────▼─────┐  ┌─────▼─────┐
+              │ KUKA KR10 │          │ RoArm #1  │  │ RoArm #2  │
+              └───────────┘          └───────────┘  └───────────┘
 
-To switch to STA mode and connect to your local network:
+            (PLC ↔ MATLAB safety handshake over OPC UA, 50 ms)
+```
 
-1. Connect your computer temporarily to the arm's AP hotspot:  
-   - SSID: `RoArm-M2`  
-   - Password: `12345678`
-2. Open a web browser and go to `http://192.168.4.1`
-3. Navigate to **WiFi Settings** → **STA Mode**
-4. Select your router/hotspot SSID and enter its password.
-5. Save and reboot the arm.
-6. After reboot, the OLED display will show the new IP address assigned by your router (e.g., `192.168.0.192`).
+## Prerequisites
 
-Repeat for each RoArm-M2-S arm.  
-**Important**: Ensure all arms and your MATLAB computer are connected to the **same network**.
+- **MATLAB R2025b** (earlier releases work for most scripts; some live scripts target R2021a).
+- **Instrument Control Toolbox** — required for `tcpclient` TCP/IP communication with the KUKA controller.
+- **Robotics System Toolbox** — used by parts of the KUKA kinematics library and unit tests.
+- A network reachable from the MATLAB host to every device (see each module README for IP configuration).
 
-## Step 3: Verify Connectivity
-From your computer (on the same network):
-1. Open a terminal/command prompt.
-2. Ping the arm's IP:
-   ```bash
-   ping 192.168.0.192
+## Quick start
 
+```matlab
+% --- KUKA pick-and-place (GUI) ---
+cd KUKA_control
+kuka_pick_and_place_gui_magnetic        % design poses, preview, execute
 
+% --- RoArm dual-arm painting (GUI) ---
+cd ../Roarm_control
+roarms_painting_process                 % Ping arms, then START PAINTING
+```
 
-# KUKA Configuration and MATLAB Control via WiFi/HTTP
+See the per-module READMEs for full setup, the communication protocols, and the complete command/API reference.

@@ -1,0 +1,47 @@
+cff-version: 1.2.0
+title: >-
+  Development of a Multirobot Control System for Painting
+  Parts with Real-Time Monitoring
+message: >-
+  If you use this work, please cite it using these metadata.
+type: software
+authors:
+  - given-names: Almat
+    family-names: Abdimalik
+  - given-names: Rassul
+    family-names: Zeinulla
+  - given-names: Collins
+    family-names: Masimba
+  - given-names: Ayan
+    family-names: Rakhmetkali
+contact:
+  - given-names: Rassul
+    family-names: Zeinulla
+    email: rassul.zeinulla@gmail.com
+abstract: >-
+  A distributed multirobot control system with real-time
+  monitoring for an automated industrial painting line. The
+  system coordinates two Waveshare RoArm-M2-S spray-painting
+  manipulators and a KUKA KR10 R1100-2 pick-and-place robot
+  with a conveyor line, using a hybrid architecture: a
+  Siemens SIMATIC S7-1500 PLC (TIA Portal V19) for
+  deterministic sequencing and safety, and a MATLAB
+  supervisory layer for trajectory generation and
+  coordination. The conveyor drive is modeled as a
+  second-order system and controlled by a MATLAB
+  auto-tuned PID verified in Simulink. Communication uses
+  PROFINET, OPC UA, TCP/IP (KukaVarProxy), and HTTP/JSON.
+keywords:
+  - robotics
+  - industrial automation
+  - PLC
+  - SIMATIC S7-1500
+  - MATLAB
+  - Simulink
+  - KUKA
+  - RoArm-M2-S
+  - PID control
+  - multi-robot coordination
+  - spray painting
+license: MIT
+date-released: '2026-06-01'
